@@ -10,7 +10,7 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 // const { MongoClient, ServerApiVersion } = require('mongodb');
-// const uri = "mongodb+srv://323mohammed0050:d14fcVdkzeeReZzi@flinn.tqooslh.mongodb.net/?retryWrites=true&w=majority&appName=Flinn";
+// const = "mongodb+srv://323mohammed0050:d14fcVdkzeeReZzi@flinn.tqooslh.mongodb.net/?retryWrites=true&w=majority&appName=Flinn";
 
 // // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 // const client = new MongoClient(uri, {
@@ -51,6 +51,43 @@ db.connect(err => {
     console.log('DB connection error:', err);
   } else {
     console.log('Connected to MySQL!');
+    
+    // Ensure tables and columns exist
+    db.query(`CREATE TABLE IF NOT EXISTS follows (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      follower_id INT NOT NULL,
+      following_id INT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY unique_follow (follower_id, following_id),
+      FOREIGN KEY (follower_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (following_id) REFERENCES users(id) ON DELETE CASCADE
+    )`, err => {
+      if (err) console.error('Error creating follows table:', err);
+    });
+
+    db.query(`SHOW COLUMNS FROM users LIKE 'bio'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE users ADD COLUMN bio TEXT`, err => {
+          if (err) console.error('Error adding bio column:', err);
+        });
+      }
+    });
+
+    db.query(`SHOW COLUMNS FROM users LIKE 'created_at'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`, err => {
+          if (err) console.error('Error adding created_at column:', err);
+        });
+      }
+    });
+
+    db.query(`SHOW COLUMNS FROM items LIKE 'author_id'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE items ADD COLUMN author_id INT`, err => {
+          if (err) console.error('Error adding author_id column to items:', err);
+        });
+      }
+    });
   }
 });
 
@@ -211,11 +248,111 @@ app.get('/users', authenticateToken, (req, res) => {
   });
 });
 
+// Get user profile
+app.get('/users/:id', optionalAuth, (req, res) => {
+  const profileId = req.params.id;
+  const currentUserId = req.user ? req.user.id : null;
+
+  const query = `
+    SELECT 
+      u.id, 
+      u.Name as name, 
+      u.username, 
+      u.email, 
+      u.bio, 
+      (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers,
+      (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following,
+      (SELECT COUNT(*) FROM items WHERE author_id = u.id) as posts,
+      u.created_at as createdAt,
+      ${currentUserId ? `(SELECT COUNT(*) > 0 FROM follows WHERE follower_id = ${currentUserId} AND following_id = u.id)` : 'FALSE'} as is_followed_by_user
+    FROM users u
+    WHERE u.id = ?
+  `;
+
+  db.query(query, [profileId], (err, results) => {
+    if (err) {
+      console.error('Error fetching user profile:', err);
+      return res.status(500).json({ message: 'Server error', error: err });
+    }
+    if (results.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.status(200).json(results[0]);
+  });
+});
+
+// Toggle follow
+app.post('/users/:id/follow', authenticateToken, (req, res) => {
+  const followingId = req.params.id;
+  const followerId = req.user.id;
+
+  if (followerId == followingId) {
+    return res.status(400).json({ success: false, message: 'You cannot follow yourself' });
+  }
+
+  // Check if already following
+  db.query('SELECT id FROM follows WHERE follower_id = ? AND following_id = ?', [followerId, followingId], (err, results) => {
+    if (err) {
+      console.error('Error checking follow status:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+
+    if (results.length > 0) {
+      // Unfollow
+      db.query('DELETE FROM follows WHERE follower_id = ? AND following_id = ?', [followerId, followingId], (deleteErr) => {
+        if (deleteErr) {
+          console.error('Error unfollowing:', deleteErr);
+          return res.status(500).json({ success: false, message: 'Database error' });
+        }
+        
+        // Get new counts
+        db.query(`SELECT 
+          (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
+          (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following`, 
+          [followingId, followingId], (countErr, countResult) => {
+          res.status(200).json({ success: true, followed: false, followers: countResult[0].followers });
+        });
+      });
+    } else {
+      // Follow
+      db.query('INSERT INTO follows (follower_id, following_id) VALUES (?, ?)', [followerId, followingId], (insertErr) => {
+        if (insertErr) {
+          console.error('Error following:', insertErr);
+          return res.status(500).json({ success: false, message: 'Database error' });
+        }
+        
+        // Get new counts
+        db.query(`SELECT 
+          (SELECT COUNT(*) FROM follows WHERE following_id = ?) as followers,
+          (SELECT COUNT(*) FROM follows WHERE follower_id = ?) as following`, 
+          [followingId, followingId], (countErr, countResult) => {
+          res.status(200).json({ success: true, followed: true, followers: countResult[0].followers });
+        });
+      });
+    }
+  });
+});
+
+// Update user profile (bio, etc)
+app.put('/users/profile', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const { name, bio } = req.body;
+
+  db.query('UPDATE users SET Name = ?, bio = ? WHERE id = ?', [name, bio, userId], (err, result) => {
+    if (err) {
+      console.error('Error updating profile:', err);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+    res.status(200).json({ success: true, message: 'Profile updated' });
+  });
+});
+
 app.get('/items', optionalAuth, (req, res) => {
   const userId = req.user ? req.user.id : null;
+  const authorId = req.query.authorId;
   
   // Query items with author name, chapter count, likes count, comments count, and is_liked_by_user
-  const query = `
+  let query = `
     SELECT 
       i.id,
       i.name,
@@ -231,10 +368,17 @@ app.get('/items', optionalAuth, (req, res) => {
       ${userId ? `(SELECT COUNT(*) > 0 FROM likes WHERE item_id = i.id AND user_id = ${userId})` : 'FALSE'} as is_liked_by_user
     FROM items i
     LEFT JOIN users u ON i.author_id = u.id
-    ORDER BY i.id DESC
   `;
+
+  const queryParams = [];
+  if (authorId) {
+    query += ` WHERE i.author_id = ?`;
+    queryParams.push(authorId);
+  }
+
+  query += ` ORDER BY i.id DESC`;
   
-  db.query(query, (err, results) => {
+  db.query(query, queryParams, (err, results) => {
     if (err) {
       console.error('Error fetching items:', err);
       return res.status(500).json({ message: 'Server error', error: err });
