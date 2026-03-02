@@ -1,0 +1,119 @@
+❌ Issue 1 — Race Condition Risk
+if (_isSyncing || !await isOnline())
+
+This is not thread-safe.
+
+Two calls to processSyncQueue() can overlap before _isSyncing = true sets.
+
+Better:
+Future<SyncResult> _processSyncQueue() async {
+  if (_isSyncing) {
+    return SyncResult(success: false, message: 'Already syncing');
+  }
+
+  _isSyncing = true;
+
+  try {
+    if (!await isOnline()) {
+      return SyncResult(success: false, message: 'Offline');
+    }
+
+Set _isSyncing = true BEFORE async gap.
+
+❌ Issue 2 — No Transaction Wrapping
+
+This is dangerous:
+
+await _itemsDao.upsertItem(...)
+await _chaptersDao.deleteChaptersByItemId(...)
+
+If app crashes mid-operation → corrupted state.
+
+Fix:
+
+Wrap multi-step local operations in Drift transaction:
+
+await _db.transaction(() async {
+  await _itemsDao.upsertItem(...);
+  await _chaptersDao.deleteChaptersByItemId(...);
+});
+
+All multi-table writes must be transactional.
+
+❌ Issue 3 — Complete Chapter Replacement Is Risky
+
+You do:
+
+await _chaptersDao.deleteChaptersByItemId(localId);
+
+Then recreate.
+
+This:
+
+Destroys change history
+
+Causes heavy DB writes
+
+Is inefficient
+
+Better:
+
+Diff-based sync
+
+Only update changed chapters
+
+But acceptable for MVP.
+
+❌ Issue 4 — No Exponential Backoff
+
+If server is down:
+
+Timer runs every 2 minutes
+→ Keeps hammering server
+→ Drains battery
+→ Risk of server rate limiting
+
+You need:
+
+retryDelay = min(retryDelay * 2, maxDelay)
+
+Otherwise this will behave badly in production.
+
+❌ Issue 5 — Connectivity Check Is Weak
+
+connectivity_plus only checks network type.
+
+It does NOT check internet reachability.
+
+WiFi with no internet still returns connected.
+
+Better approach:
+
+Ping your backend:
+
+await _api.ping();
+
+Then decide online.
+
+❌ Issue 6 — No Conflict Resolution
+
+You mentioned:
+
+Conflict resolution (complete item overwrite)
+
+But I don’t see actual conflict detection.
+
+There is no:
+
+updatedAt comparison
+
+server version check
+
+merge logic
+
+Currently:
+
+Last writer wins blindly.
+
+This is fine for single-device user.
+Not safe for multi-device editing.

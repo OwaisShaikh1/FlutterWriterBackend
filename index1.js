@@ -65,6 +65,22 @@ db.connect(err => {
       if (err) console.error('Error creating follows table:', err);
     });
 
+    // Create changelog table for efficient sync
+    db.query(`CREATE TABLE IF NOT EXISTS changelog (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      entity_type ENUM('item', 'chapter') NOT NULL,
+      entity_id INT NOT NULL,
+      parent_id INT NULL,
+      operation ENUM('create', 'update', 'delete') NOT NULL,
+      user_id INT,
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_changed_at (changed_at),
+      INDEX idx_entity_type (entity_type, entity_id)
+    )`, err => {
+      if (err) console.error('Error creating changelog table:', err);
+      else console.log('Changelog table ready');
+    });
+
     db.query(`SHOW COLUMNS FROM users LIKE 'bio'`, (err, results) => {
       if (!err && results.length === 0) {
         db.query(`ALTER TABLE users ADD COLUMN bio TEXT`, err => {
@@ -88,6 +104,71 @@ db.connect(err => {
         });
       }
     });
+
+    db.query(`SHOW COLUMNS FROM users LIKE 'library'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE users ADD COLUMN library JSON DEFAULT NULL`, err => {
+          if (err) console.error('Error adding library column:', err);
+        });
+      }
+    });
+
+    // Add timestamps to items table
+    db.query(`SHOW COLUMNS FROM items LIKE 'created_at'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE items ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`, err => {
+          if (err) console.error('Error adding created_at to items:', err);
+          else console.log('✅ Added created_at to items');
+        });
+      }
+    });
+
+    db.query(`SHOW COLUMNS FROM items LIKE 'updated_at'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE items ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`, err => {
+          if (err) console.error('Error adding updated_at to items:', err);
+          else console.log('✅ Added updated_at to items');
+        });
+      }
+    });
+
+    // Add timestamps to chapters table
+    db.query(`SHOW COLUMNS FROM chapters LIKE 'created_at'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE chapters ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`, err => {
+          if (err) console.error('Error adding created_at to chapters:', err);
+          else console.log('✅ Added created_at to chapters');
+        });
+      }
+    });
+
+    db.query(`SHOW COLUMNS FROM chapters LIKE 'updated_at'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE chapters ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`, err => {
+          if (err) console.error('Error adding updated_at to chapters:', err);
+          else console.log('✅ Added updated_at to chapters');
+        });
+      }
+    });
+
+    // Add version columns for conflict resolution
+    db.query(`SHOW COLUMNS FROM items LIKE 'version'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE items ADD COLUMN version INT DEFAULT 1`, err => {
+          if (err) console.error('Error adding version to items:', err);
+          else console.log('✅ Added version to items');
+        });
+      }
+    });
+
+    db.query(`SHOW COLUMNS FROM chapters LIKE 'version'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE chapters ADD COLUMN version INT DEFAULT 1`, err => {
+          if (err) console.error('Error adding version to chapters:', err);
+          else console.log('✅ Added version to chapters');
+        });
+      }
+    });
   }
 });
 
@@ -102,6 +183,17 @@ const generateToken = (user) => {
   });
 
   return token;
+};
+
+// Helper function to log changes to changelog table
+const logChange = (entityType, entityId, operation, userId = null, parentId = null) => {
+  db.query(
+    'INSERT INTO changelog (entity_type, entity_id, parent_id, operation, user_id) VALUES (?, ?, ?, ?, ?)',
+    [entityType, entityId, parentId, operation, userId],
+    (err) => {
+      if (err) console.error('Error logging change:', err);
+    }
+  );
 };
 
 function authenticateToken(req, res, next) {
@@ -155,6 +247,15 @@ app.post('/verify-token', (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('API is running');
+});
+
+// Health check endpoint for connectivity testing
+app.get('/ping', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Server is reachable',
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.post('/register', async (req, res) => {
@@ -260,6 +361,7 @@ app.get('/users/:id', optionalAuth, (req, res) => {
       u.username, 
       u.email, 
       u.bio, 
+      u.library,
       (SELECT COUNT(*) FROM follows WHERE following_id = u.id) as followers,
       (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following,
       (SELECT COUNT(*) FROM items WHERE author_id = u.id) as posts,
@@ -336,9 +438,32 @@ app.post('/users/:id/follow', authenticateToken, (req, res) => {
 // Update user profile (bio, etc)
 app.put('/users/profile', authenticateToken, (req, res) => {
   const userId = req.user.id;
-  const { name, bio } = req.body;
+  const { name, bio, library } = req.body;
 
-  db.query('UPDATE users SET Name = ?, bio = ? WHERE id = ?', [name, bio, userId], (err, result) => {
+  let updates = [];
+  let params = [];
+
+  if (name !== undefined) {
+    updates.push('Name = ?');
+    params.push(name);
+  }
+  if (bio !== undefined) {
+    updates.push('bio = ?');
+    params.push(bio);
+  }
+  if (library !== undefined) {
+    updates.push('library = ?');
+    params.push(typeof library === 'string' ? library : JSON.stringify(library));
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ success: false, message: 'No fields to update' });
+  }
+
+  let query = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
+  params.push(userId);
+
+  db.query(query, params, (err, result) => {
     if (err) {
       console.error('Error updating profile:', err);
       return res.status(500).json({ success: false, message: 'Database error' });
@@ -350,6 +475,7 @@ app.put('/users/profile', authenticateToken, (req, res) => {
 app.get('/items', optionalAuth, (req, res) => {
   const userId = req.user ? req.user.id : null;
   const authorId = req.query.authorId;
+  const ids = req.query.ids;
   
   // Query items with author name, chapter count, likes count, comments count, and is_liked_by_user
   let query = `
@@ -361,6 +487,8 @@ app.get('/items', optionalAuth, (req, res) => {
       i.review,
       i.image_path,
       i.author_id,
+      i.created_at,
+      i.updated_at,
       COALESCE(u.Name, u.username, 'Unknown Author') as author,
       (SELECT COUNT(DISTINCT number) FROM chapters WHERE item_id = i.id) as chapters,
       (SELECT COUNT(*) FROM likes WHERE item_id = i.id) as likes_count,
@@ -371,24 +499,94 @@ app.get('/items', optionalAuth, (req, res) => {
   `;
 
   const queryParams = [];
+  const whereClauses = [];
+
   if (authorId) {
-    query += ` WHERE i.author_id = ?`;
+    whereClauses.push(`i.author_id = ?`);
     queryParams.push(authorId);
   }
 
+  if (ids) {
+    const idList = ids.split(',').map(id => parseInt(id)).filter(id => !isNaN(id));
+    if (idList.length > 0) {
+      whereClauses.push(`i.id IN (${idList.join(',')})`);
+    }
+  }
+
+  if (whereClauses.length > 0) {
+    query += ` WHERE ` + whereClauses.join(' AND ');
+  }
+
   query += ` ORDER BY i.id DESC`;
+  
+  console.log('📥 GET /items - Query params:', { authorId, ids, userId });
+  console.log('📥 GET /items - SQL:', query);
   
   db.query(query, queryParams, (err, results) => {
     if (err) {
       console.error('Error fetching items:', err);
       return res.status(500).json({ message: 'Server error', error: err });
     }
+    
+    console.log(`✅ GET /items - Returning ${results.length} items`);
+    if (results.length > 0) {
+      console.log('   First item:', results[0].name, '(ID:', results[0].id + ')');
+      if (results.length > 1) {
+        console.log('   Last item:', results[results.length - 1].name, '(ID:', results[results.length - 1].id + ')');
+      }
+    }
+    
     res.status(200).json(results);
   });
 });
 
+// Get a single item by ID
+app.get('/items/:id', optionalAuth, (req, res) => {
+  const itemId = req.params.id;
+  const userId = req.user ? req.user.id : null;
+  
+  const query = `
+    SELECT 
+      i.id,
+      i.name,
+      i.type,
+      i.description,
+      i.review,
+      i.image_path,
+      i.author_id,
+      i.created_at,
+      i.updated_at,
+      i.version,
+      COALESCE(u.Name, u.username, 'Unknown Author') as author,
+      (SELECT COUNT(DISTINCT number) FROM chapters WHERE item_id = i.id) as chapters,
+      (SELECT COUNT(*) FROM likes WHERE item_id = i.id) as likes_count,
+      (SELECT COUNT(*) FROM comments WHERE item_id = i.id) as comments_count,
+      ${userId ? `(SELECT COUNT(*) > 0 FROM likes WHERE item_id = i.id AND user_id = ${userId})` : 'FALSE'} as is_liked_by_user
+    FROM items i
+    LEFT JOIN users u ON i.author_id = u.id
+    WHERE i.id = ?
+  `;
+  
+  console.log(`📥 GET /items/${itemId} - Fetching single item`);
+  
+  db.query(query, [itemId], (err, results) => {
+    if (err) {
+      console.error('Error fetching item:', err);
+      return res.status(500).json({ message: 'Server error', error: err });
+    }
+    
+    if (results.length === 0) {
+      console.log(`⚠️ GET /items/${itemId} - Item not found`);
+      return res.status(404).json({ message: 'Item not found' });
+    }
+    
+    console.log(`✅ GET /items/${itemId} - Returning:`, results[0].name);
+    res.status(200).json(results[0]);
+  });
+});
+
 app.get('/chapters', (req, res) => {
-  const { bookId, chapterNumber } = req.query;
+  const { bookId, chapterNumber, metadataOnly } = req.query;
 
   // If chapterNumber is provided, get specific chapter; otherwise get all chapters for the book.
   // Use GROUP BY / subquery to deduplicate: if duplicate rows exist for the same
@@ -397,6 +595,20 @@ app.get('/chapters', (req, res) => {
     db.query(
       'SELECT * FROM chapters WHERE item_id = ? AND number = ? ORDER BY id DESC LIMIT 1',
       [bookId, chapterNumber],
+      (err, results) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        res.json(results);
+      }
+    );
+  } else if (metadataOnly === 'true') {
+    // Get chapter metadata without content (for lazy loading)
+    db.query(
+      `SELECT c.id, c.item_id, c.number, c.name AS title FROM chapters c
+       INNER JOIN (
+         SELECT MAX(id) AS max_id FROM chapters WHERE item_id = ? GROUP BY number
+       ) latest ON c.id = latest.max_id
+       ORDER BY c.number`,
+      [bookId],
       (err, results) => {
         if (err) return res.status(500).json({ error: 'Database error' });
         res.json(results);
@@ -438,10 +650,13 @@ app.post('/items', authenticateToken, (req, res) => {
         return res.status(500).json({ success: false, message: 'Database error', error: err.message });
       }
       
+      const itemId = result.insertId;
+      logChange('item', itemId, 'create', authorId);
+      
       res.status(201).json({ 
         success: true, 
         message: 'Item created successfully',
-        itemId: result.insertId 
+        itemId: itemId 
       });
     }
   );
@@ -476,6 +691,11 @@ app.post('/chapters', authenticateToken, (req, res) => {
         return res.status(500).json({ success: false, message: 'Database error', error: err.message });
       }
 
+      // Log change for each chapter
+      chapters.forEach(ch => {
+        logChange('chapter', ch.number, 'create', req.user.id, itemId);
+      });
+
       res.status(201).json({
         success: true,
         message: `${result.affectedRows} chapters created successfully`
@@ -487,11 +707,11 @@ app.post('/chapters', authenticateToken, (req, res) => {
 // Update an existing literature item
 app.put('/items/:id', authenticateToken, (req, res) => {
   const itemId = req.params.id;
-  const { name, type, description, review, imageUrl } = req.body;
+  const { name, type, description, review, imageUrl, version } = req.body;
   const authorId = req.user.id;
 
-  // First verify the user owns this item
-  db.query('SELECT author_id FROM items WHERE id = ?', [itemId], (err, results) => {
+  // First verify the user owns this item and get current version
+  db.query('SELECT author_id, version, updated_at FROM items WHERE id = ?', [itemId], (err, results) => {
     if (err) {
       console.error('Error checking item ownership:', err);
       return res.status(500).json({ success: false, message: 'Database error' });
@@ -505,24 +725,44 @@ app.put('/items/:id', authenticateToken, (req, res) => {
       return res.status(403).json({ success: false, message: 'You can only edit your own works' });
     }
 
-    // Update the item
-    const sql = `UPDATE items SET name = ?, type = ?, description = ?, review = ?, image_path = ? WHERE id = ?`;
+    const currentVersion = results[0].version || 1;
+    const clientVersion = version || 1;
     
-    db.query(sql, [name, type, description || '', review || 0, imageUrl || null, itemId], 
+    // Check for version conflicts
+    if (clientVersion !== currentVersion) {
+      return res.status(409).json({ 
+        success: false, 
+        message: 'Version conflict detected',
+        conflict: {
+          serverVersion: currentVersion,
+          clientVersion: clientVersion,
+          serverUpdatedAt: results[0].updated_at
+        }
+      });
+    }
+
+    // Update the item with incremented version
+    const newVersion = currentVersion + 1;
+    const sql = `UPDATE items SET name = ?, type = ?, description = ?, review = ?, image_path = ?, version = ?, updated_at = NOW() WHERE id = ?`;
+    
+    db.query(sql, [name, type, description || '', review || 0, imageUrl || null, newVersion, itemId], 
       (updateErr, result) => {
         if (updateErr) {
           console.error('Error updating item:', updateErr);
           return res.status(500).json({ success: false, message: 'Database error', error: updateErr.message });
         }
         
+        logChange('item', itemId, 'update', authorId);
+        
         res.status(200).json({ 
           success: true, 
-          message: 'Item updated successfully'
+          message: 'Item updated successfully',
+          version: newVersion
         });
-      }
-    );
+      });
+    });
   });
-});
+
 
 // Update chapters for an item (delete old and insert new)
 app.put('/chapters/:itemId', authenticateToken, (req, res) => {
@@ -615,6 +855,8 @@ app.put('/chapters/:itemId/:chapterNumber', authenticateToken, (req, res) => {
           return res.status(404).json({ success: false, message: 'Chapter not found' });
         }
 
+        logChange('chapter', number || chapterNumber, 'update', authorId, itemId);
+
         res.status(200).json({
           success: true,
           message: 'Chapter updated successfully'
@@ -657,6 +899,8 @@ app.delete('/chapters/:itemId/:chapterNumber', authenticateToken, (req, res) => 
       if (result.affectedRows === 0) {
         return res.status(404).json({ success: false, message: 'Chapter not found' });
       }
+
+      logChange('chapter', chapterNumber, 'delete', authorId, itemId);
 
       res.status(200).json({
         success: true,
@@ -917,6 +1161,8 @@ app.delete('/items/:id', authenticateToken, (req, res) => {
           return res.status(500).json({ success: false, message: 'Database error' });
         }
 
+        logChange('item', itemId, 'delete', authorId);
+
         res.status(200).json({ success: true, message: 'Item deleted successfully' });
       });
     });
@@ -991,6 +1237,43 @@ app.post('/sync-images', (req, res) => {
       await Promise.all(updatePromises);
 
       return res.json({ updated, failed, success, failures });
+    });
+  });
+});
+
+// Get changelog - returns all changes since a specific timestamp
+app.get('/changelog', authenticateToken, (req, res) => {
+  const { since } = req.query;
+  
+  if (!since) {
+    return res.status(400).json({ error: 'since parameter required (ISO timestamp)' });
+  }
+
+  const query = `
+    SELECT 
+      id,
+      entity_type,
+      entity_id,
+      parent_id,
+      operation,
+      user_id,
+      changed_at
+    FROM changelog 
+    WHERE changed_at > ? 
+    ORDER BY changed_at ASC
+    LIMIT 1000
+  `;
+  
+  db.query(query, [since], (err, results) => {
+    if (err) {
+      console.error('Error fetching changelog:', err);
+      return res.status(500).json({ error: 'Database error' });
+    }
+    
+    res.json({
+      changes: results,
+      count: results.length,
+      hasMore: results.length === 1000
     });
   });
 });
