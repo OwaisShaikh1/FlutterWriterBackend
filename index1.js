@@ -24,6 +24,16 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// Global request logger — logs every incoming request before routing
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`[${req.method}] ${req.originalUrl} → ${res.statusCode} (${ms}ms) | Auth: ${req.headers['authorization'] ? 'YES' : 'NO'}`);
+  });
+  next();
+});
+
 
 // async function run() {
 //   try {
@@ -63,6 +73,31 @@ db.connect(err => {
       FOREIGN KEY (following_id) REFERENCES users(id) ON DELETE CASCADE
     )`, err => {
       if (err) console.error('Error creating follows table:', err);
+    });
+
+    // Deduplicate chapters: keep only the highest id per (item_id, number) pair
+    db.query(`
+      DELETE c1 FROM chapters c1
+      INNER JOIN chapters c2
+        ON c1.item_id = c2.item_id AND c1.number = c2.number AND c1.id < c2.id
+    `, err => {
+      if (err) console.error('Error deduplicating chapters:', err);
+      else {
+        // Add UNIQUE constraint if it doesn't already exist
+        db.query(`
+          SELECT COUNT(*) AS cnt FROM information_schema.TABLE_CONSTRAINTS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = 'chapters'
+            AND CONSTRAINT_NAME = 'unique_chapter_per_item'
+        `, (err, rows) => {
+          if (!err && rows[0].cnt === 0) {
+            db.query(`ALTER TABLE chapters ADD UNIQUE KEY unique_chapter_per_item (item_id, number)`, err => {
+              if (err) console.error('Error adding unique constraint to chapters:', err);
+              else console.log('✅ Added UNIQUE(item_id, number) to chapters');
+            });
+          }
+        });
+      }
     });
 
     // Create changelog table for efficient sync
@@ -200,11 +235,16 @@ function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
-  if (!token) return res.status(401).json({ message: 'Access token missing' });
+  if (!token) {
+    console.warn(`🔒 AUTH FAIL [${req.method} ${req.originalUrl}]: No token provided`);
+    return res.status(401).json({ message: 'Access token missing' });
+  }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ message: 'Invalid or expired token' });
-
+    if (err) {
+      console.warn(`🔒 AUTH FAIL [${req.method} ${req.originalUrl}]: ${err.message}`);
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
     req.user = user;
     next();
   });
@@ -789,10 +829,16 @@ app.put('/chapters/:itemId', authenticateToken, (req, res) => {
       return res.status(403).json({ success: false, message: 'You can only edit your own works' });
     }
 
-    // Delete existing chapters
-    db.query('DELETE FROM chapters WHERE item_id = ?', [itemId], (deleteErr) => {
+    // Delete chapters that are no longer in the new list
+    const newNumbers = chapters.map(ch => ch.number);
+    const deleteSql = newNumbers.length > 0
+      ? 'DELETE FROM chapters WHERE item_id = ? AND number NOT IN (?)'
+      : 'DELETE FROM chapters WHERE item_id = ?';
+    const deleteParams = newNumbers.length > 0 ? [itemId, newNumbers] : [itemId];
+
+    db.query(deleteSql, deleteParams, (deleteErr) => {
       if (deleteErr) {
-        console.error('Error deleting chapters:', deleteErr);
+        console.error('Error deleting removed chapters:', deleteErr);
         return res.status(500).json({ success: false, message: 'Database error', error: deleteErr.message });
       }
 
@@ -800,9 +846,10 @@ app.put('/chapters/:itemId', authenticateToken, (req, res) => {
         return res.status(200).json({ success: true, message: 'All chapters deleted' });
       }
 
-      // Insert new chapters
+      // Upsert: insert new chapters, update existing ones by (item_id, number)
       const values = chapters.map(ch => [ch.number, ch.title, itemId, ch.content]);
-      const sql = 'INSERT INTO chapters (number, name, item_id, Text) VALUES ?';
+      const sql = `INSERT INTO chapters (number, name, item_id, Text) VALUES ?
+                   ON DUPLICATE KEY UPDATE name = VALUES(name), Text = VALUES(Text)`;
 
       db.query(sql, [values], (insertErr, result) => {
         if (insertErr) {
