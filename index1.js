@@ -100,6 +100,34 @@ db.connect(err => {
       }
     });
 
+    // Deduplicate items: keep only the highest id per (author_id, name, type)
+    db.query(`
+      DELETE i1 FROM items i1
+      INNER JOIN items i2
+        ON i1.author_id = i2.author_id
+        AND i1.name = i2.name
+        AND i1.type = i2.type
+        AND i1.id < i2.id
+    `, err => {
+      if (err) console.error('Error deduplicating items:', err);
+      else {
+        // Add UNIQUE constraint if it doesn't already exist
+        db.query(`
+          SELECT COUNT(*) AS cnt FROM information_schema.TABLE_CONSTRAINTS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND TABLE_NAME = 'items'
+            AND CONSTRAINT_NAME = 'unique_item_per_author'
+        `, (err, rows) => {
+          if (!err && rows[0].cnt === 0) {
+            db.query(`ALTER TABLE items ADD UNIQUE KEY unique_item_per_author (author_id, name, type)`, err => {
+              if (err) console.error('Error adding unique constraint to items:', err);
+              else console.log('✅ Added UNIQUE(author_id, name, type) to items');
+            });
+          }
+        });
+      }
+    });
+
     // Create changelog table for efficient sync
     db.query(`CREATE TABLE IF NOT EXISTS changelog (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -163,6 +191,30 @@ db.connect(err => {
         db.query(`ALTER TABLE items ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`, err => {
           if (err) console.error('Error adding updated_at to items:', err);
           else console.log('✅ Added updated_at to items');
+        });
+      }
+    });
+
+    // Add client_request_id for idempotent mobile create retries
+    db.query(`SHOW COLUMNS FROM items LIKE 'client_request_id'`, (err, results) => {
+      if (!err && results.length === 0) {
+        db.query(`ALTER TABLE items ADD COLUMN client_request_id VARCHAR(128) NULL`, err => {
+          if (err) console.error('Error adding client_request_id to items:', err);
+          else console.log('✅ Added client_request_id to items');
+        });
+      }
+    });
+
+    db.query(`
+      SELECT COUNT(*) AS cnt FROM information_schema.TABLE_CONSTRAINTS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'items'
+        AND CONSTRAINT_NAME = 'unique_item_client_request_id'
+    `, (err, rows) => {
+      if (!err && rows[0].cnt === 0) {
+        db.query(`ALTER TABLE items ADD UNIQUE KEY unique_item_client_request_id (client_request_id)`, err => {
+          if (err) console.error('Error adding unique constraint to client_request_id:', err);
+          else console.log('✅ Added UNIQUE(client_request_id) to items');
         });
       }
     });
@@ -527,6 +579,7 @@ app.get('/items', optionalAuth, (req, res) => {
       i.review,
       i.image_path,
       i.author_id,
+      i.version,
       i.created_at,
       i.updated_at,
       COALESCE(u.Name, u.username, 'Unknown Author') as author,
@@ -627,17 +680,21 @@ app.get('/items/:id', optionalAuth, (req, res) => {
 
 app.get('/chapters', (req, res) => {
   const { bookId, chapterNumber, metadataOnly } = req.query;
+  console.log(`📥 GET /chapters - bookId: ${bookId}, chapterNumber: ${chapterNumber}`);
 
   // If chapterNumber is provided, get specific chapter; otherwise get all chapters for the book.
-  // Use GROUP BY / subquery to deduplicate: if duplicate rows exist for the same
-  // (item_id, number) (created by retried syncs), return only the latest one.
+  // Use GROUP BY / subquery to deduplicate
   if (chapterNumber) {
     db.query(
-      'SELECT * FROM chapters WHERE item_id = ? AND number = ? ORDER BY id DESC LIMIT 1',
+      'SELECT *, Text as content FROM chapters WHERE item_id = ? AND number = ? ORDER BY id DESC LIMIT 1',
       [bookId, chapterNumber],
       (err, results) => {
-        if (err) return res.status(500).json({ error: 'Database error' });
-        res.json(results);
+        if (err) {
+          console.error('Error fetching chapter:', err);
+          return res.status(500).json({ error: 'Database error' });
+        }
+        // Return a single object instead of an array for single chapter requests
+        res.json(results[0] || null);
       }
     );
   } else if (metadataOnly === 'true') {
@@ -673,30 +730,107 @@ app.get('/chapters', (req, res) => {
 
 // Create a new literature item
 app.post('/items', authenticateToken, (req, res) => {
-  const { name, type, description, review, imageUrl } = req.body;
+  const { name, type, description, review, imageUrl, clientRequestId } = req.body;
   const authorId = req.user.id; // Use logged-in user as author
+  const normalizedRequestId = typeof clientRequestId === 'string' && clientRequestId.trim().length > 0
+    ? clientRequestId.trim().slice(0, 128)
+    : null;
 
   if (!name || !type) {
     return res.status(400).json({ success: false, message: 'Name and type are required' });
   }
 
-  const sql = `INSERT INTO items (name, author_id, type, description, review, image_path) 
-               VALUES (?, ?, ?, ?, ?, ?)`;
+  // If this exact client request was already processed, return the same item.
+  if (normalizedRequestId) {
+    db.query(
+      'SELECT id FROM items WHERE client_request_id = ? LIMIT 1',
+      [normalizedRequestId],
+      (lookupErr, lookupRows) => {
+        if (lookupErr) {
+          console.error('Error checking idempotency key:', lookupErr);
+          return res.status(500).json({ success: false, message: 'Database error', error: lookupErr.message });
+        }
+
+        if (lookupRows.length > 0) {
+          return res.status(200).json({
+            success: true,
+            message: 'Duplicate create request detected, returning existing item',
+            itemId: lookupRows[0].id,
+            created: false
+          });
+        }
+
+        const sql = `
+          INSERT INTO items (name, author_id, type, description, review, image_path, client_request_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            description = VALUES(description),
+            review = VALUES(review),
+            image_path = VALUES(image_path),
+            client_request_id = IFNULL(client_request_id, VALUES(client_request_id)),
+            updated_at = NOW(),
+            id = LAST_INSERT_ID(id)
+        `;
+
+        db.query(
+          sql,
+          [name, authorId, type, description || '', review || 0, imageUrl || null, normalizedRequestId],
+          (err, result) => {
+            if (err) {
+              console.error('Error creating/upserting item:', err);
+              return res.status(500).json({ success: false, message: 'Database error', error: err.message });
+            }
+
+            const itemId = result.insertId;
+            const isNew = result.affectedRows === 1; // 1 = insert, 2 = duplicate hit
+
+            if (isNew) {
+              logChange('item', itemId, 'create', authorId);
+            }
+
+            res.status(isNew ? 201 : 200).json({
+              success: true,
+              message: isNew ? 'Item created successfully' : 'Item already exists, returning existing',
+              itemId,
+              created: isNew
+            });
+          }
+        );
+      }
+    );
+    return;
+  }
+
+  const sql = `
+    INSERT INTO items (name, author_id, type, description, review, image_path, client_request_id) 
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+    ON DUPLICATE KEY UPDATE
+      description = VALUES(description),
+      review = VALUES(review),
+      image_path = VALUES(image_path),
+      updated_at = NOW(),
+      id = LAST_INSERT_ID(id)
+  `;
   
   db.query(sql, [name, authorId, type, description || '', review || 0, imageUrl || null], 
     (err, result) => {
       if (err) {
-        console.error('Error creating item:', err);
+        console.error('Error creating/upserting item:', err);
         return res.status(500).json({ success: false, message: 'Database error', error: err.message });
       }
       
       const itemId = result.insertId;
-      logChange('item', itemId, 'create', authorId);
+      const isNew = result.affectedRows === 1; // 1 = insert, 2 = duplicate hit
+
+      if (isNew) {
+        logChange('item', itemId, 'create', authorId);
+      }
       
-      res.status(201).json({ 
+      res.status(isNew ? 201 : 200).json({ 
         success: true, 
-        message: 'Item created successfully',
-        itemId: itemId 
+        message: isNew ? 'Item created successfully' : 'Item already exists, returning existing',
+        itemId,
+        created: isNew
       });
     }
   );
