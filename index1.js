@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
 // const { MongoClient, ServerApiVersion } = require('mongodb');
 // const = "mongodb+srv://323mohammed0050:d14fcVdkzeeReZzi@flinn.tqooslh.mongodb.net/?retryWrites=true&w=majority&appName=Flinn";
 
@@ -23,6 +24,35 @@ const bcrypt = require('bcryptjs');
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+const imagesDir = path.join(__dirname, 'static', 'images');
+if (!fs.existsSync(imagesDir)) {
+  fs.mkdirSync(imagesDir, { recursive: true });
+}
+
+const imageStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, imagesDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const safeExt = ext && ext.length <= 8 ? ext : '.jpg';
+    const stamp = Date.now();
+    const rand = Math.floor(Math.random() * 1e9);
+    cb(null, `img_${stamp}_${rand}${safeExt}`);
+  },
+});
+
+const imageUpload = multer({
+  storage: imageStorage,
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const mimeValue = file.mimetype || file.mimeType || '';
+    if (mimeValue.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'));
+    }
+  },
+});
 
 // Global request logger — logs every incoming request before routing
 app.use((req, res, next) => {
@@ -126,22 +156,6 @@ db.connect(err => {
           }
         });
       }
-    });
-
-    // Create changelog table for efficient sync
-    db.query(`CREATE TABLE IF NOT EXISTS changelog (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      entity_type ENUM('item', 'chapter') NOT NULL,
-      entity_id INT NOT NULL,
-      parent_id INT NULL,
-      operation ENUM('create', 'update', 'delete') NOT NULL,
-      user_id INT,
-      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_changed_at (changed_at),
-      INDEX idx_entity_type (entity_type, entity_id)
-    )`, err => {
-      if (err) console.error('Error creating changelog table:', err);
-      else console.log('Changelog table ready');
     });
 
     db.query(`SHOW COLUMNS FROM users LIKE 'bio'`, (err, results) => {
@@ -270,17 +284,6 @@ const generateToken = (user) => {
   });
 
   return token;
-};
-
-// Helper function to log changes to changelog table
-const logChange = (entityType, entityId, operation, userId = null, parentId = null) => {
-  db.query(
-    'INSERT INTO changelog (entity_type, entity_id, parent_id, operation, user_id) VALUES (?, ?, ?, ?, ?)',
-    [entityType, entityId, parentId, operation, userId],
-    (err) => {
-      if (err) console.error('Error logging change:', err);
-    }
-  );
 };
 
 function authenticateToken(req, res, next) {
@@ -433,6 +436,20 @@ app.post('/login', (req, res) => {
 
 // ✅ Serve static images
 app.use('/static/images', express.static(path.join(__dirname, 'static', 'images')));  // <-- New line
+
+// Upload image and return a server-hosted relative path.
+app.post('/uploads/images', authenticateToken, imageUpload.single('image'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'Image file is required' });
+  }
+
+  const relativePath = path.join('static', 'images', req.file.filename).replace(/\\/g, '/');
+  return res.status(201).json({
+    success: true,
+    imagePath: relativePath,
+    imageUrl: `${req.protocol}://${req.get('host')}/${relativePath}`,
+  });
+});
 
 app.get('/users', authenticateToken, (req, res) => {
   db.query('SELECT username FROM users', (err, results) => {
@@ -784,10 +801,6 @@ app.post('/items', authenticateToken, (req, res) => {
             const itemId = result.insertId;
             const isNew = result.affectedRows === 1; // 1 = insert, 2 = duplicate hit
 
-            if (isNew) {
-              logChange('item', itemId, 'create', authorId);
-            }
-
             res.status(isNew ? 201 : 200).json({
               success: true,
               message: isNew ? 'Item created successfully' : 'Item already exists, returning existing',
@@ -822,10 +835,6 @@ app.post('/items', authenticateToken, (req, res) => {
       const itemId = result.insertId;
       const isNew = result.affectedRows === 1; // 1 = insert, 2 = duplicate hit
 
-      if (isNew) {
-        logChange('item', itemId, 'create', authorId);
-      }
-      
       res.status(isNew ? 201 : 200).json({ 
         success: true, 
         message: isNew ? 'Item created successfully' : 'Item already exists, returning existing',
@@ -865,11 +874,6 @@ app.post('/chapters', authenticateToken, (req, res) => {
         return res.status(500).json({ success: false, message: 'Database error', error: err.message });
       }
 
-      // Log change for each chapter
-      chapters.forEach(ch => {
-        logChange('chapter', ch.number, 'create', req.user.id, itemId);
-      });
-
       res.status(201).json({
         success: true,
         message: `${result.affectedRows} chapters created successfully`
@@ -881,11 +885,11 @@ app.post('/chapters', authenticateToken, (req, res) => {
 // Update an existing literature item
 app.put('/items/:id', authenticateToken, (req, res) => {
   const itemId = req.params.id;
-  const { name, type, description, review, imageUrl, version } = req.body;
+  const { name, type, description, review, imageUrl, last_updated } = req.body;
   const authorId = req.user.id;
 
-  // First verify the user owns this item and get current version
-  db.query('SELECT author_id, version, updated_at FROM items WHERE id = ?', [itemId], (err, results) => {
+  // First verify the user owns this item and get current updated_at
+  db.query('SELECT author_id, updated_at FROM items WHERE id = ?', [itemId], (err, results) => {
     if (err) {
       console.error('Error checking item ownership:', err);
       return res.status(500).json({ success: false, message: 'Database error' });
@@ -899,43 +903,86 @@ app.put('/items/:id', authenticateToken, (req, res) => {
       return res.status(403).json({ success: false, message: 'You can only edit your own works' });
     }
 
-    const currentVersion = results[0].version || 1;
-    const clientVersion = version || 1;
+    const serverUpdatedAt = new Date(results[0].updated_at).getTime();
+    const clientUpdatedAt = last_updated ? new Date(last_updated).getTime() : 0;
     
-    // Check for version conflicts
-    if (clientVersion !== currentVersion) {
+    // Compare timestamps - client must be newer or equal to update
+    if (clientUpdatedAt < serverUpdatedAt) {
       return res.status(409).json({ 
         success: false, 
-        message: 'Version conflict detected',
+        message: 'Server has newer version',
         conflict: {
-          serverVersion: currentVersion,
-          clientVersion: clientVersion,
-          serverUpdatedAt: results[0].updated_at
+          serverUpdatedAt: results[0].updated_at,
+          clientUpdatedAt: last_updated
         }
       });
     }
 
-    // Update the item with incremented version
-    const newVersion = currentVersion + 1;
-    const sql = `UPDATE items SET name = ?, type = ?, description = ?, review = ?, image_path = ?, version = ?, updated_at = NOW() WHERE id = ?`;
+    // Update the item
+    const sql = `UPDATE items SET name = ?, type = ?, description = ?, review = ?, image_path = ?, updated_at = NOW() WHERE id = ?`;
     
-    db.query(sql, [name, type, description || '', review || 0, imageUrl || null, newVersion, itemId], 
+    db.query(sql, [name, type, description || '', review || 0, imageUrl || null, itemId], 
       (updateErr, result) => {
         if (updateErr) {
           console.error('Error updating item:', updateErr);
           return res.status(500).json({ success: false, message: 'Database error', error: updateErr.message });
         }
         
-        logChange('item', itemId, 'update', authorId);
-        
-        res.status(200).json({ 
-          success: true, 
-          message: 'Item updated successfully',
-          version: newVersion
+        // Get the new updated_at timestamp
+        db.query('SELECT updated_at FROM items WHERE id = ?', [itemId], (err, rows) => {
+          res.status(200).json({ 
+            success: true, 
+            message: 'Item updated successfully',
+            updated_at: rows ? rows[0].updated_at : new Date()
+          });
         });
       });
     });
   });
+
+// Upload and directly update item image (owner only)
+app.post('/items/:id/image', authenticateToken, imageUpload.single('image'), (req, res) => {
+  const itemId = req.params.id;
+  const authorId = req.user.id;
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'Image file is required' });
+  }
+
+  db.query('SELECT author_id FROM items WHERE id = ?', [itemId], (findErr, rows) => {
+    if (findErr) {
+      console.error('Error checking item before image update:', findErr);
+      return res.status(500).json({ success: false, message: 'Database error' });
+    }
+
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found' });
+    }
+
+    if (rows[0].author_id !== authorId) {
+      return res.status(403).json({ success: false, message: 'You can only edit your own works' });
+    }
+
+    const relativePath = path.join('static', 'images', req.file.filename).replace(/\\/g, '/');
+    db.query(
+      'UPDATE items SET image_path = ?, updated_at = NOW(), version = version + 1 WHERE id = ?',
+      [relativePath, itemId],
+      (updateErr) => {
+        if (updateErr) {
+          console.error('Error updating item image:', updateErr);
+          return res.status(500).json({ success: false, message: 'Database error' });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: 'Item image updated',
+          imagePath: relativePath,
+          imageUrl: `${req.protocol}://${req.get('host')}/${relativePath}`,
+        });
+      }
+    );
+  });
+});
 
 
 // Update chapters for an item (delete old and insert new)
@@ -1036,8 +1083,6 @@ app.put('/chapters/:itemId/:chapterNumber', authenticateToken, (req, res) => {
           return res.status(404).json({ success: false, message: 'Chapter not found' });
         }
 
-        logChange('chapter', number || chapterNumber, 'update', authorId, itemId);
-
         res.status(200).json({
           success: true,
           message: 'Chapter updated successfully'
@@ -1080,8 +1125,6 @@ app.delete('/chapters/:itemId/:chapterNumber', authenticateToken, (req, res) => 
       if (result.affectedRows === 0) {
         return res.status(404).json({ success: false, message: 'Chapter not found' });
       }
-
-      logChange('chapter', chapterNumber, 'delete', authorId, itemId);
 
       res.status(200).json({
         success: true,
@@ -1342,8 +1385,6 @@ app.delete('/items/:id', authenticateToken, (req, res) => {
           return res.status(500).json({ success: false, message: 'Database error' });
         }
 
-        logChange('item', itemId, 'delete', authorId);
-
         res.status(200).json({ success: true, message: 'Item deleted successfully' });
       });
     });
@@ -1421,44 +1462,6 @@ app.post('/sync-images', (req, res) => {
     });
   });
 });
-
-// Get changelog - returns all changes since a specific timestamp
-app.get('/changelog', authenticateToken, (req, res) => {
-  const { since } = req.query;
-  
-  if (!since) {
-    return res.status(400).json({ error: 'since parameter required (ISO timestamp)' });
-  }
-
-  const query = `
-    SELECT 
-      id,
-      entity_type,
-      entity_id,
-      parent_id,
-      operation,
-      user_id,
-      changed_at
-    FROM changelog 
-    WHERE changed_at > ? 
-    ORDER BY changed_at ASC
-    LIMIT 1000
-  `;
-  
-  db.query(query, [since], (err, results) => {
-    if (err) {
-      console.error('Error fetching changelog:', err);
-      return res.status(500).json({ error: 'Database error' });
-    }
-    
-    res.json({
-      changes: results,
-      count: results.length,
-      hasMore: results.length === 1000
-    });
-  });
-});
-
 
 // ✅ Start server
 const PORT = process.env.PORT || 5000;
